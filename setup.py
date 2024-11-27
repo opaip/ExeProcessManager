@@ -12,12 +12,12 @@ setup(
             'exe-process-manager = exe_process_manager:main',  # Optional if you want a command-line entry point
         ],
     },
-    author="Your Name",
-    author_email="your.email@example.com",
+    author="ali",
+    author_email="opaipp.mi@gmail.com",
     description="A process manager for executing and monitoring .exe files.",
     long_description=open('README.md').read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/exe-process-manager",  # Replace with your actual URL
+    url="https://github.com/opaip/ExeProcessManager",  # Replace with your actual URL
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
