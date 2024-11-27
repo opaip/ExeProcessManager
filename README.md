@@ -82,7 +82,7 @@ The above code will:
 Start MockProcess1 10 seconds after running the script.
 Stop MockProcess1 20 seconds after running the script.
 
-## ** 3. Monitor and Auto-Restart Processes**
+## **3. Monitor and Auto-Restart Processes**
 ```python
 from ExeProcessManager import ExeProcessManager, Process
 import time
