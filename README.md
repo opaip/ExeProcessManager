@@ -23,8 +23,7 @@ This project includes a **Process Manager** for managing system processes, and a
 Clone the repository to your local machine:
 
 ```bash
-git clone https://github.com/yourusername/process-manager-scheduler.git
-cd process-manager-scheduler
+git clone https://github.com/opaip/ExeProcessManager.git
 ```
 
 Install the required dependencies (if any):
@@ -36,7 +35,7 @@ pip install -r requirements.txt
 **1. Using the `ExeProcessManager`**
 You can use the ExeProcessManager class to manage processes on your system.
 ```python
-from process_manager import ExeProcessManager, Process
+from ExeProcessManager import ExeProcessManager, Process
 
 # Create a process object
 process1 = Process(path="path_to_executable1.exe", name="MockProcess1")
@@ -57,7 +56,7 @@ manager.stop_process("MockProcess1")
 ## **2. Using the Scheduler**
 You can use the Scheduler to schedule actions like starting and stopping processes.
 ```python
-from process_manager import Scheduler, ExeProcessManager, Process
+from ExeProcessManager import Scheduler, ExeProcessManager, Process
 from datetime import datetime, timedelta
 
 # Initialize the process manager and add a process
@@ -85,7 +84,7 @@ Stop MockProcess1 20 seconds after running the script.
 
 ## ** 3. Monitor and Auto-Restart Processes**
 ```python
-from process_manager import ExeProcessManager, Process
+from ExeProcessManager import ExeProcessManager, Process
 import time
 
 # Initialize the process manager and add a process
