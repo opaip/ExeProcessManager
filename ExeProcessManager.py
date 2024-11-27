@@ -1,3 +1,4 @@
+import os
 import subprocess
 import time
 import logging
@@ -57,6 +58,9 @@ class Process:
                 "cpu": proc.cpu_percent(interval=0.1),
                 "memory": proc.memory_info().rss / 1024**2,  # Memory in MB
             }
+        except psutil.NoSuchProcess:
+            self.is_running = False
+            return {"cpu": 0, "memory": 0}
         except Exception as e:
             logging.error(f"Error fetching resource usage for '{self.name}': {e}")
             return {"cpu": 0, "memory": 0}
@@ -68,6 +72,8 @@ class Process:
                 ps = psutil.Process(self.process.pid)
                 ps.nice(priority)
                 logging.info(f"Set priority for '{self.name}' to {priority}.")
+            except psutil.NoSuchProcess:
+                self.is_running = False
             except Exception as e:
                 logging.error(f"Error setting priority for '{self.name}': {e}")
 
@@ -102,6 +108,10 @@ class ExeProcessManager:
         if not process:
             return False
 
+        if not os.path.exists(process.path):
+            logging.error(f"Executable '{process.path}' not found for process '{process.name}'.")
+            return False
+
         if process.dependencies:
             for dep in process.dependencies:
                 if not self.start_process(dep):
@@ -114,7 +124,7 @@ class ExeProcessManager:
                 return False
 
             args = [process.path] + process.args
-            process.process = subprocess.Popen(args, shell=True)
+            process.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             process.is_running = True
             logging.info(f"Started process '{process.name}'.")
             return True
@@ -130,9 +140,12 @@ class ExeProcessManager:
             return False
         try:
             process.process.terminate()
-            process.process.wait()
+            process.process.wait(timeout=10)
             process.is_running = False
             logging.info(f"Stopped process '{process.name}'.")
+            return True
+        except psutil.NoSuchProcess:
+            process.is_running = False
             return True
         except Exception as e:
             logging.error(f"Error stopping process '{process.name}': {e}")
@@ -147,30 +160,35 @@ class ExeProcessManager:
 
     def start_all(self):
         """Start all processes."""
-        for process in self.processes.values():
-            self.start_process(process.name)
+        with self.lock:
+            for process in self.processes.values():
+                self.start_process(process.name)
 
     def stop_all(self):
         """Stop all processes."""
-        for process in self.processes.values():
-            self.stop_process(process.name)
+        with self.lock:
+            for process in self.processes.values():
+                self.stop_process(process.name)
 
     def restart_all(self):
         """Restart all processes."""
-        for process in self.processes.values():
-            self.restart_process(process.name)
+        with self.lock:
+            for process in self.processes.values():
+                self.restart_process(process.name)
 
     def start_group(self, tag):
         """Start all processes with the specified tag."""
-        for process in self.processes.values():
-            if process.tag == tag:
-                self.start_process(process.name)
+        with self.lock:
+            for process in self.processes.values():
+                if process.tag == tag:
+                    self.start_process(process.name)
 
     def stop_group(self, tag):
         """Stop all processes with the specified tag."""
-        for process in self.processes.values():
-            if process.tag == tag:
-                self.stop_process(process.name)
+        with self.lock:
+            for process in self.processes.values():
+                if process.tag == tag:
+                    self.stop_process(process.name)
 
     def schedule_process(self, identifier, action, time_str):
         """Schedule a process to perform an action at a specific time."""
@@ -192,10 +210,11 @@ class ExeProcessManager:
     def monitor_processes(self, check_interval=5):
         """Monitor all processes and restart if needed."""
         while True:
-            for process in self.processes.values():
-                if process.is_running and process.process.poll() is not None:
-                    logging.warning(f"Process '{process.name}' stopped unexpectedly. Restarting...")
-                    self.restart_process(process.name)
+            with self.lock:
+                for process in self.processes.values():
+                    if process.is_running and process.process.poll() is not None:
+                        logging.warning(f"Process '{process.name}' stopped unexpectedly. Restarting...")
+                        self.restart_process(process.name)
             time.sleep(check_interval)
 
     def graceful_shutdown(self):
@@ -215,6 +234,3 @@ class ExeProcessManager:
         except FileNotFoundError:
             logging.warning(f"Log file for '{process.name}' not found.")
             return None
-
-
-
