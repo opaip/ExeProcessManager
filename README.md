@@ -56,31 +56,41 @@ manager.stop_process("MockProcess1")
 ## **2. Using the Scheduler**
 You can use the Scheduler to schedule actions like starting and stopping processes.
 ```python
-from ExeProcessManager import Scheduler, ExeProcessManager, Process
-from datetime import datetime, timedelta
+from ExeProcessManager import ExeProcessManager, Process
 
-# Initialize the process manager and add a process
-process1 = Process(path="path_to_executable1.exe", name="MockProcess1")
+# Initialize the process manager
 manager = ExeProcessManager()
+
+# Add a process to the manager
+process1 = Process(path="path_to_executable1.exe", name="MockProcess1")
 manager.add_process(process1)
 
-# Initialize the scheduler
-scheduler = Scheduler()
+# Schedule the process to start at 12:00 PM
+manager.schedule_process("MockProcess1", "start", "12:00")
 
-# Schedule a process to start in 10 seconds
-now = datetime.now()
-scheduler.add_job(manager.start_process, "MockProcess1", now + timedelta(seconds=10))
+# Schedule the process to stop at 12:10 PM
+manager.schedule_process("MockProcess1", "stop", "12:10")
 
-# Schedule a process to stop in 20 seconds
-scheduler.add_job(manager.stop_process, "MockProcess1", now + timedelta(seconds=20))
+# Schedule the process to restart at 12:15 PM
+manager.schedule_process("MockProcess1", "restart", "12:15")
 
-# Start the scheduler
-scheduler.start()
+# Keep the scheduler running
+while True:
+    schedule.run_pending()
+    time.sleep(1)
 ```
-The above code will:
+What this example does:
 
-Start MockProcess1 10 seconds after running the script.
-Stop MockProcess1 20 seconds after running the script.
+1. Start MockProcess1 at 12:00 PM.
+
+
+2. Stop MockProcess1 at 12:10 PM.
+
+
+3. Restart MockProcess1 at 12:15 PM.
+
+
+4. Keeps the scheduler running to execute these actions.
 
 ## **3. Monitor and Auto-Restart Processes**
 ```python
