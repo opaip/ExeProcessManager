@@ -52,16 +52,27 @@ class Process:
         """Get CPU and memory usage of the process."""
         if not self.is_running or not self.process:
             return {"cpu": 0, "memory": 0}
+        
         try:
             proc = psutil.Process(self.process.pid)
+            # Check if the process is still alive
+            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+                logging.warning(f"Process '{self.name}' with PID {self.process.pid} is no longer active.")
+                self.is_running = False
+                return {"cpu": 0, "memory": 0}
+
+            # Retrieve resource usage
             return {
-                "cpu": proc.cpu_percent(interval=0.1),
+                "cpu": proc.cpu_percent(interval=0.1),  # Short interval for CPU usage
                 "memory": proc.memory_info().rss / 1024**2,  # Memory in MB
             }
         except psutil.NoSuchProcess:
+            # Process is no longer active
+            logging.warning(f"Process '{self.name}' with PID {self.process.pid} no longer exists.")
             self.is_running = False
             return {"cpu": 0, "memory": 0}
         except Exception as e:
+            # Handle other unexpected errors
             logging.error(f"Error fetching resource usage for '{self.name}': {e}")
             return {"cpu": 0, "memory": 0}
 
@@ -99,8 +110,8 @@ class ExeProcessManager:
             for process in self.processes.values():
                 if process.name == identifier or process.tag == identifier or process.idd == identifier:
                     return process
-            logging.error(f"No process found with identifier: {identifier}")
-            return None
+            logging.warning(f"No process found with identifier: {identifier}")
+            return None  # Immediately return None if process is not found
 
     def start_process(self, identifier):
         """Start a specific process."""
@@ -123,52 +134,92 @@ class ExeProcessManager:
                 logging.warning(f"Process '{process.name}' is already running.")
                 return False
 
+            # Correct handling for Windows
             args = [process.path] + process.args
-            process.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process.process = subprocess.Popen(args)  # Do not join args with space
+
             process.is_running = True
             logging.info(f"Started process '{process.name}'.")
             return True
         except Exception as e:
             logging.error(f"Error starting process '{process.name}': {e}")
             return False
-
-    def stop_process(self, identifier):
-        """Stop a specific process."""
-        process = self.get_process(identifier)
-        if not process or not process.is_running:
-            logging.warning(f"Process '{identifier}' is not running.")
-            return False
-        try:
-            process.process.terminate()
-            process.process.wait(timeout=10)
-            process.is_running = False
-            logging.info(f"Stopped process '{process.name}'.")
-            return True
-        except psutil.NoSuchProcess:
-            process.is_running = False
-            return True
-        except Exception as e:
-            logging.error(f"Error stopping process '{process.name}': {e}")
-            return False
-
+   
     def restart_process(self, identifier):
         """Restart a specific process."""
-        if self.stop_process(identifier):
-            time.sleep(1)
-            return self.start_process(identifier)
-        return False
+        process = self.get_process(identifier)
+        if not process:
+            logging.error(f"Process '{identifier}' not found.")
+            return False
 
+        try:
+            if process.is_running:
+                logging.info(f"Stopping process '{process.name}' to restart...")
+                self.stop_process(identifier)  # This will run asynchronously and raise an exception if failed
+            else:
+                logging.info(f"Process '{process.name}' is not running. Skipping stop step.")
+            
+            logging.info(f"Starting process '{process.name}' again...")
+            if self.start_process(identifier):
+                logging.info(f"Successfully restarted process '{process.name}'.")
+                return True
+            else:
+                logging.error(f"Failed to restart process '{process.name}'.")
+                return False
+        except Exception as e:
+            logging.error(f"Failed to restart process '{process.name}': {e}")
+            return False
+    
     def start_all(self):
         """Start all processes."""
         with self.lock:
             for process in self.processes.values():
                 self.start_process(process.name)
+    
+    def stop_process(self, identifier):
+        """Stop a specific process asynchronously."""
+        def stop():
+            process = self.get_process(identifier)
 
-    def stop_all(self):
-        """Stop all processes."""
-        with self.lock:
-            for process in self.processes.values():
-                self.stop_process(process.name)
+            if not process:
+                logging.warning(f"Process '{identifier}' not found.")
+                return False  # Return False if process is not found
+
+            with self.lock:  # Lock access to the shared resource (process state)
+                if not process.is_running:
+                    logging.info(f"Process '{identifier}' is not running.")
+                    return True  # Process is already not running, no need to stop
+
+                try:
+                    logging.info(f"Stopping process '{identifier}'...")
+                    process.process.terminate()  # Attempt to gracefully stop
+                    process.process.communicate()  # Ensure that we clean up the subprocess
+                    process.is_running = False
+                    logging.info(f"Successfully stopped process '{identifier}'.")
+                    return True  # Successfully stopped
+                except subprocess.TimeoutExpired:
+                    logging.warning(f"Process '{identifier}' didn't stop in time, forcefully terminating.")
+                    process.process.kill()  # Force kill if the process takes too long to stop
+                    process.process.communicate()  # Clean up any remaining process
+                    process.is_running = False
+                    return False  # Return False if it couldn't stop within the timeout
+                except Exception as e:
+                    logging.error(f"Error stopping process '{identifier}': {e}")
+                    return False  # Return False on error
+
+        stop_thread = threading.Thread(target=stop, daemon=False)  # Change daemon=False to ensure cleanup
+        stop_thread.start()
+
+        # Wait for the background thread to complete before checking the result
+        stop_thread.join()  # This ensures that we wait for the stop operation to complete
+        process = self.get_process(identifier)
+
+        if process and not process.is_running:
+            logging.info(f"Process '{identifier}' has been successfully stopped.")
+            return True  # Process is stopped successfully
+        else:
+            logging.error(f"Failed to stop process '{identifier}' or it is still running.")
+            return False  # Failed to stop the process
 
     def restart_all(self):
         """Restart all processes."""
@@ -217,10 +268,25 @@ class ExeProcessManager:
                         self.restart_process(process.name)
             time.sleep(check_interval)
 
-    def graceful_shutdown(self):
-        """Shut down all processes gracefully."""
-        self.stop_all()
-        logging.info("All processes stopped. Exiting.")
+    def graceful_shutdown(self, timeout=30):
+        """Shut down all processes gracefully with a timeout."""
+        try:
+            start_time = time.time()
+            for process in self.processes.values():
+                self.stop_process(process.name)
+
+            # Wait until all processes are stopped or timeout is reached
+            while time.time() - start_time < timeout:
+                all_stopped = all(not process.is_running for process in self.processes.values())
+                if all_stopped:
+                    break
+                time.sleep(1)
+            else:
+                logging.warning("Timeout reached while waiting for processes to stop.")
+            
+            logging.info("All processes stopped.")
+        except Exception as e:
+            logging.error(f"Error during graceful shutdown: {e}")
 
     def view_logs(self, identifier):
         """View logs for a specific process."""
