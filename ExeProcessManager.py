@@ -1,302 +1,259 @@
 import os
 import subprocess
-import time
-import logging
 import threading
+import logging
+import time
 import psutil
-import schedule
+from enum import Enum, auto
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Callable
+from pathlib import Path
 
-# Initialize logging
-logging.basicConfig(
-    filename="process_manager.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+# --- Configuration & State Types ---
 
+class ProcessState(Enum):
+    """Enumeration of possible process lifecycle states."""
+    IDLE = auto()
+    STARTING = auto()
+    RUNNING = auto()
+    STOPPING = auto()
+    STOPPED = auto()
+    FAILED = auto()
+    CRASHED = auto()
 
-class Process:
-    def __init__(
-        self,
-        path=None,
-        name=None,
-        tag=None,
-        idd=None,
-        thread=None,
-        schulRule=None,
-        args=None,
-        dependencies=None,
-    ):
-        """
-        Represents a single process to be managed.
-        :param path: Path to the .exe file or executable script.
-        :param name: Name of the process.
-        :param tag: Tag for categorization.
-        :param idd: Unique identifier for the process.
-        :param thread: Thread for handling the process.
-        :param schulRule: Scheduling rules.
-        :param args: Command-line arguments for the process.
-        :param dependencies: List of dependent process names that must start before this one.
-        """
-        self.path = path
-        self.name = name
-        self.tag = tag
-        self.idd = idd
-        self.schulRule = schulRule
-        self.args = args or []
-        self.dependencies = dependencies or []
-        self.process = None
-        self.is_running = False
-        self.thread = None
+@dataclass(frozen=True)
+class ProcessConfig:
+    """Immutable configuration for a managed process."""
+    name: str
+    executable_path: Path
+    args: List[str] = field(default_factory=list)
+    tags: Set[str] = field(default_factory=set)
+    dependencies: List[str] = field(default_factory=list)
+    auto_restart: bool = True
+    working_dir: Optional[Path] = None
 
-    def get_resource_usage(self):
-        """Get CPU and memory usage of the process."""
-        if not self.is_running or not self.process:
-            return {"cpu": 0, "memory": 0}
+# --- Managed Process Implementation ---
+
+class ManagedProcess:
+    """
+    Encapsulates the lifecycle and health monitoring of a single OS process.
+    """
+    def __init__(self, config: ProcessConfig):
+        self.config = config
+        self.state = ProcessState.IDLE
+        self._proc_handle: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+        self.logger = logging.getLogger(f"Process.{config.name}")
+        
+        # Ensure log directory exists if needed
+        self.log_file = Path(f"logs/{config.name}.log")
+        self.log_file.parent.mkdir(exist_ok=True)
+
+    def spawn(self) -> bool:
+        """Attempts to start the process with thread-safe state transition."""
+        with self._lock:
+            if self.state == ProcessState.RUNNING:
+                self.logger.info("Process already running.")
+                return True
+
+            self.state = ProcessState.STARTING
+            try:
+                # Prepare command
+                cmd = [str(self.config.executable_path)] + self.config.args
+                
+                # Open log file for output redirection
+                log_fh = open(self.log_file, "a")
+                
+                self._proc_handle = subprocess.Popen(
+                    cmd,
+                    cwd=self.config.working_dir,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+                )
+                
+                self.state = ProcessState.RUNNING
+                self.logger.info(f"Successfully spawned (PID: {self._proc_handle.pid})")
+                return True
+            except Exception as e:
+                self.state = ProcessState.FAILED
+                self.logger.error(f"Failed to spawn process: {str(e)}")
+                return False
+
+    def terminate(self, timeout: float = 10.0) -> bool:
+        """Gracefully terminates then kills the process if it persists."""
+        with self._lock:
+            if not self._proc_handle or self.state in [ProcessState.STOPPED, ProcessState.IDLE]:
+                return True
+
+            self.state = ProcessState.STOPPING
+            try:
+                self._proc_handle.terminate()
+                try:
+                    self._proc_handle.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self.logger.warning("Graceful termination timed out. Escalating to kill.")
+                    self._proc_handle.kill()
+                    self._proc_handle.wait()
+                
+                self.state = ProcessState.STOPPED
+                self.logger.info("Process stopped.")
+                return True
+            except Exception as e:
+                self.logger.error(f"Error during termination: {e}")
+                return False
+
+    def poll_health(self) -> ProcessState:
+        """Checks the current OS status of the process and updates internal state."""
+        with self._lock:
+            if self.state != ProcessState.RUNNING:
+                return self.state
+
+            exit_code = self._proc_handle.poll()
+            if exit_code is not None:
+                if exit_code == 0:
+                    self.state = ProcessState.STOPPED
+                else:
+                    self.state = ProcessState.CRASHED
+                    self.logger.error(f"Detected crash. Exit code: {exit_code}")
+            
+            return self.state
+
+    def get_metrics(self) -> Dict:
+        """Retrieves resource usage metrics using psutil."""
+        if self.state != ProcessState.RUNNING or not self._proc_handle:
+            return {"cpu_percent": 0.0, "memory_mb": 0.0}
         
         try:
-            proc = psutil.Process(self.process.pid)
-            # Check if the process is still alive
-            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
-                logging.warning(f"Process '{self.name}' with PID {self.process.pid} is no longer active.")
-                self.is_running = False
-                return {"cpu": 0, "memory": 0}
-
-            # Retrieve resource usage
+            p = psutil.Process(self._proc_handle.pid)
             return {
-                "cpu": proc.cpu_percent(interval=0.1),  # Short interval for CPU usage
-                "memory": proc.memory_info().rss / 1024**2,  # Memory in MB
+                "cpu_percent": p.cpu_percent(interval=0.1),
+                "memory_mb": p.memory_info().rss / (1024 * 1024)
             }
-        except psutil.NoSuchProcess:
-            # Process is no longer active
-            logging.warning(f"Process '{self.name}' with PID {self.process.pid} no longer exists.")
-            self.is_running = False
-            return {"cpu": 0, "memory": 0}
-        except Exception as e:
-            # Handle other unexpected errors
-            logging.error(f"Error fetching resource usage for '{self.name}': {e}")
-            return {"cpu": 0, "memory": 0}
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return {"cpu_percent": 0.0, "memory_mb": 0.0}
 
-    def set_priority(self, priority):
-        """Set the process priority."""
-        if self.process and self.is_running:
-            try:
-                ps = psutil.Process(self.process.pid)
-                ps.nice(priority)
-                logging.info(f"Set priority for '{self.name}' to {priority}.")
-            except psutil.NoSuchProcess:
-                self.is_running = False
-            except Exception as e:
-                logging.error(f"Error setting priority for '{self.name}': {e}")
+# --- Orchestrator Implementation ---
 
-
-class ExeProcessManager:
+class ProcessOrchestrator:
+    """
+    High-level manager for coordinating multiple processes and their dependencies.
+    """
     def __init__(self):
-        self.processes = {}
-        self.lock = threading.Lock()
+        self._registry: Dict[str, ManagedProcess] = {}
+        self._global_lock = threading.RLock() # Recursive lock for nested dependency starts
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s | %(name)-15s | %(levelname)-8s | %(message)s'
+        )
+        self.logger = logging.getLogger("Orchestrator")
 
-    def add_process(self, process: Process):
-        """Add a process to the manager."""
-        with self.lock:
-            if process.name in self.processes:
-                logging.warning(f"Process '{process.name}' already exists.")
-                return False
-            self.processes[process.name] = process
-            logging.info(f"Process '{process.name}' added successfully.")
-            return True
+    def register(self, config: ProcessConfig):
+        """Adds a process configuration to the managed registry."""
+        with self._global_lock:
+            if config.name in self._registry:
+                self.logger.warning(f"Overwriting existing process: {config.name}")
+            self._registry[config.name] = ManagedProcess(config)
 
-    def get_process(self, identifier):
-        """Retrieve a process by name, tag, or id."""
-        with self.lock:
-            for process in self.processes.values():
-                if process.name == identifier or process.tag == identifier or process.idd == identifier:
-                    return process
-            logging.warning(f"No process found with identifier: {identifier}")
-            return None  # Immediately return None if process is not found
-
-    def start_process(self, identifier):
-        """Start a specific process."""
-        process = self.get_process(identifier)
+    def _start_recursive(self, name: str, visited: Set[str]):
+        """Internal method to resolve and start dependencies using DFS."""
+        if name in visited:
+            raise RuntimeError(f"Circular dependency detected: {' -> '.join(visited)} -> {name}")
+        
+        visited.add(name)
+        process = self._registry.get(name)
+        
         if not process:
-            return False
+            self.logger.error(f"Dependency '{name}' not found in registry.")
+            return
 
-        if not os.path.exists(process.path):
-            logging.error(f"Executable '{process.path}' not found for process '{process.name}'.")
-            return False
+        # 1. Resolve dependencies first
+        for dep_name in process.config.dependencies:
+            self._start_recursive(dep_name, visited.copy())
 
-        if process.dependencies:
-            for dep in process.dependencies:
-                if not self.start_process(dep):
-                    logging.error(f"Dependency '{dep}' failed to start.")
-                    return False
+        # 2. Start this process
+        process.spawn()
 
-        try:
-            if process.is_running:
-                logging.warning(f"Process '{process.name}' is already running.")
-                return False
+    def start_process(self, name: str):
+        """Public interface to start a process and its dependency tree."""
+        with self._global_lock:
+            try:
+                self._start_recursive(name, set())
+            except Exception as e:
+                self.logger.error(f"Aborting start of {name}: {e}")
 
-            # Correct handling for Windows
-            args = [process.path] + process.args
-            process.process = subprocess.Popen(args)  # Do not join args with space
+    def stop_all(self):
+        """Gracefully shuts down all managed processes."""
+        with self._global_lock:
+            self.logger.info("Initiating global shutdown...")
+            for proc in self._registry.values():
+                proc.terminate()
 
-            process.is_running = True
-            logging.info(f"Started process '{process.name}'.")
-            return True
-        except Exception as e:
-            logging.error(f"Error starting process '{process.name}': {e}")
-            return False
-   
-    def restart_process(self, identifier):
-        """Restart a specific process."""
-        process = self.get_process(identifier)
-        if not process:
-            logging.error(f"Process '{identifier}' not found.")
-            return False
+    def run_health_monitor(self, interval: float = 2.0):
+        """Starts a background thread for continuous health monitoring."""
+        def monitor_task():
+            while not self._stop_event.is_set():
+                with self._global_lock:
+                    for name, proc in self._registry.items():
+                        current_state = proc.poll_health()
+                        
+                        if current_state == ProcessState.CRASHED and proc.config.auto_restart:
+                            self.logger.info(f"Auto-restarting crashed process: {name}")
+                            self.start_process(name)
+                
+                self._stop_event.wait(interval)
 
-        try:
-            if process.is_running:
-                logging.info(f"Stopping process '{process.name}' to restart...")
-                self.stop_process(identifier)  # This will run asynchronously and raise an exception if failed
-            else:
-                logging.info(f"Process '{process.name}' is not running. Skipping stop step.")
-            
-            logging.info(f"Starting process '{process.name}' again...")
-            if self.start_process(identifier):
-                logging.info(f"Successfully restarted process '{process.name}'.")
-                return True
-            else:
-                logging.error(f"Failed to restart process '{process.name}'.")
-                return False
-        except Exception as e:
-            logging.error(f"Failed to restart process '{process.name}': {e}")
-            return False
+        self._monitor_thread = threading.Thread(target=monitor_task, daemon=True)
+        self._monitor_thread.start()
+        self.logger.info("Health monitor active.")
+
+    def shutdown_orchestrator(self):
+        """Full cleanup of the orchestrator and all children."""
+        self._stop_event.set()
+        self.stop_all()
+        if self._monitor_thread:
+            self._monitor_thread.join()
+        self.logger.info("Orchestrator offline.")
+
+# --- Example Usage ---
+
+if __name__ == "__main__":
+    # Standard engineering practice: wrap execution in entry point
+    orchestrator = ProcessOrchestrator()
     
-    def start_all(self):
-        """Start all processes."""
-        with self.lock:
-            for process in self.processes.values():
-                self.start_process(process.name)
+    # 1. Define configurations
+    # Note: Using placeholders since specific paths vary by system
+    config_a = ProcessConfig(
+        name="BackendService",
+        executable_path=Path("python.exe"),
+        args=["-m", "http.server", "8080"],
+        auto_restart=True
+    )
     
-    def stop_process(self, identifier):
-        """Stop a specific process asynchronously."""
-        def stop():
-            process = self.get_process(identifier)
+    config_b = ProcessConfig(
+        name="DataProcessor",
+        executable_path=Path("python.exe"),
+        args=["-c", "import time; print('Working...'); time.sleep(10)"],
+        dependencies=["BackendService"],
+        auto_restart=False
+    )
 
-            if not process:
-                logging.warning(f"Process '{identifier}' not found.")
-                return False  # Return False if process is not found
+    # 2. Register and Start
+    orchestrator.register(config_a)
+    orchestrator.register(config_b)
+    
+    orchestrator.run_health_monitor()
+    
+    # Starting DataProcessor will automatically start BackendService first
+    orchestrator.start_process("DataProcessor")
 
-            with self.lock:  # Lock access to the shared resource (process state)
-                if not process.is_running:
-                    logging.info(f"Process '{identifier}' is not running.")
-                    return True  # Process is already not running, no need to stop
-
-                try:
-                    logging.info(f"Stopping process '{identifier}'...")
-                    process.process.terminate()  # Attempt to gracefully stop
-                    process.process.communicate()  # Ensure that we clean up the subprocess
-                    process.is_running = False
-                    logging.info(f"Successfully stopped process '{identifier}'.")
-                    return True  # Successfully stopped
-                except subprocess.TimeoutExpired:
-                    logging.warning(f"Process '{identifier}' didn't stop in time, forcefully terminating.")
-                    process.process.kill()  # Force kill if the process takes too long to stop
-                    process.process.communicate()  # Clean up any remaining process
-                    process.is_running = False
-                    return False  # Return False if it couldn't stop within the timeout
-                except Exception as e:
-                    logging.error(f"Error stopping process '{identifier}': {e}")
-                    return False  # Return False on error
-
-        stop_thread = threading.Thread(target=stop, daemon=False)  # Change daemon=False to ensure cleanup
-        stop_thread.start()
-
-        # Wait for the background thread to complete before checking the result
-        stop_thread.join()  # This ensures that we wait for the stop operation to complete
-        process = self.get_process(identifier)
-
-        if process and not process.is_running:
-            logging.info(f"Process '{identifier}' has been successfully stopped.")
-            return True  # Process is stopped successfully
-        else:
-            logging.error(f"Failed to stop process '{identifier}' or it is still running.")
-            return False  # Failed to stop the process
-
-    def restart_all(self):
-        """Restart all processes."""
-        with self.lock:
-            for process in self.processes.values():
-                self.restart_process(process.name)
-
-    def start_group(self, tag):
-        """Start all processes with the specified tag."""
-        with self.lock:
-            for process in self.processes.values():
-                if process.tag == tag:
-                    self.start_process(process.name)
-
-    def stop_group(self, tag):
-        """Stop all processes with the specified tag."""
-        with self.lock:
-            for process in self.processes.values():
-                if process.tag == tag:
-                    self.stop_process(process.name)
-
-    def schedule_process(self, identifier, action, time_str):
-        """Schedule a process to perform an action at a specific time."""
-        process = self.get_process(identifier)
-        if not process:
-            return False
-
-        def job():
-            if action == "start":
-                self.start_process(identifier)
-            elif action == "stop":
-                self.stop_process(identifier)
-            elif action == "restart":
-                self.restart_process(identifier)
-
-        schedule.every().day.at(time_str).do(job)
-        logging.info(f"Scheduled '{action}' for process '{identifier}' at {time_str}.")
-
-    def monitor_processes(self, check_interval=5):
-        """Monitor all processes and restart if needed."""
+    try:
         while True:
-            with self.lock:
-                for process in self.processes.values():
-                    if process.is_running and process.process.poll() is not None:
-                        logging.warning(f"Process '{process.name}' stopped unexpectedly. Restarting...")
-                        self.restart_process(process.name)
-            time.sleep(check_interval)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        orchestrator.shutdown_orchestrator()
 
-    def graceful_shutdown(self, timeout=30):
-        """Shut down all processes gracefully with a timeout."""
-        try:
-            start_time = time.time()
-            for process in self.processes.values():
-                self.stop_process(process.name)
-
-            # Wait until all processes are stopped or timeout is reached
-            while time.time() - start_time < timeout:
-                all_stopped = all(not process.is_running for process in self.processes.values())
-                if all_stopped:
-                    break
-                time.sleep(1)
-            else:
-                logging.warning("Timeout reached while waiting for processes to stop.")
-            
-            logging.info("All processes stopped.")
-        except Exception as e:
-            logging.error(f"Error during graceful shutdown: {e}")
-
-    def view_logs(self, identifier):
-        """View logs for a specific process."""
-        process = self.get_process(identifier)
-        if not process:
-            return None
-        log_file = f"{process.name}.log"
-        try:
-            with open(log_file, "r") as file:
-                return file.read()
-        except FileNotFoundError:
-            logging.warning(f"Log file for '{process.name}' not found.")
-            return None
